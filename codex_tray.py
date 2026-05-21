@@ -25,8 +25,8 @@ except ImportError:
 
 STATUS_FILE        = Path.home() / ".codex-usage"  / "status.json"
 CLAUDE_STATUS_FILE = Path.home() / ".claude-usage" / "status.json"
-MONITOR_SCRIPT        = Path(__file__).parent / "codex_monitor.py"
-CLAUDE_MONITOR_SCRIPT = Path(__file__).parent / "claude_monitor.py"
+MONITOR_SCRIPT        = Path(__file__).resolve().parent / "codex_monitor.py"
+CLAUDE_MONITOR_SCRIPT = Path(__file__).resolve().parent / "claude_monitor.py"
 ICON_SIZE = 64
 FILE_POLL_INTERVAL = 30   # seconds between re-reads of status files
 STALE_WARN_MINUTES = 60   # warn in tooltip when data is this old
@@ -256,7 +256,10 @@ class CodexTray:
                 items.append(Item(f"  Updated: {age_str}", None, enabled=False))
 
         items.append(pystray.Menu.SEPARATOR)
-        items.append(Item("Refresh now", self._on_refresh))
+        if self._refreshing:
+            items.append(Item("Refreshing…", None, enabled=False))
+        else:
+            items.append(Item("Refresh now", self._on_refresh))
         items.append(Item("Quit", self._on_quit))
 
         return pystray.Menu(*items)
@@ -271,31 +274,41 @@ class CodexTray:
     def _on_refresh(self, icon=None, item=None) -> None:
         if self._refreshing:
             return
+        self._refreshing = True
+        self._icon.menu = self._build_menu()   # show "Refreshing…" immediately
         threading.Thread(target=self._do_refresh, daemon=True).start()
 
     def _do_refresh(self) -> None:
-        self._refreshing = True
+        def run_monitor(script, timeout=60):
+            try:
+                p = subprocess.Popen(
+                    [sys.executable, str(script)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                _, err = p.communicate(timeout=timeout)
+                if p.returncode != 0 and err:
+                    print(f"[codex_tray] {script.name} error: {err.decode()[:200]}",
+                          file=sys.stderr)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+                print(f"[codex_tray] {script.name} timed out.", file=sys.stderr)
+            except Exception as exc:
+                print(f"[codex_tray] {script.name} failed: {exc}", file=sys.stderr)
+
         try:
-            # Run both monitors in parallel
-            procs = [
-                subprocess.Popen([sys.executable, str(MONITOR_SCRIPT)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
-                subprocess.Popen([sys.executable, str(CLAUDE_MONITOR_SCRIPT)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
-            ]
-            for p in procs:
-                try:
-                    _, err = p.communicate(timeout=60)
-                    if p.returncode != 0 and err:
-                        print(f"[codex_tray] Monitor error: {err.decode()[:200]}", file=sys.stderr)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    print("[codex_tray] Monitor timed out.", file=sys.stderr)
+            t1 = threading.Thread(target=run_monitor, args=(MONITOR_SCRIPT,),        daemon=True)
+            t2 = threading.Thread(target=run_monitor, args=(CLAUDE_MONITOR_SCRIPT,), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
             self._reload()
         except Exception as exc:
             print(f"[codex_tray] Refresh error: {exc}", file=sys.stderr)
         finally:
             self._refreshing = False
+            self._icon.menu = self._build_menu()
 
     def _on_quit(self, icon=None, item=None) -> None:
         self._icon.stop()
