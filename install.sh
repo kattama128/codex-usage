@@ -45,10 +45,10 @@ mkdir -p "$AUTOSTART_DIR"
 cat > "$AUTOSTART_DIR/codex-tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Codex Usage Tray
-Exec=python3 $REPO_DIR/codex_tray.py
+Name=Codex + Claude Usage Tray
+Exec=bash -c "pkill -f codex_tray.py; sleep 1; exec python3 $REPO_DIR/codex_tray.py"
 Icon=utilities-system-monitor
-Comment=Shows Codex CLI usage limits in the system tray
+Comment=Shows Codex + Claude CLI usage limits in the system tray
 Categories=Utility;
 X-GNOME-Autostart-enabled=true
 StartupNotify=false
