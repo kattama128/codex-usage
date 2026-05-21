@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import re
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -26,15 +27,19 @@ STATUS_FILE = Path.home() / ".codex-usage" / "status.json"
 
 # ── regex patterns ────────────────────────────────────────────────────────────
 
+_RE_ANSI = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
+
 # Matches: "5h limit:   [████░░░░] 49% left (resets 16:59)"
 _RE_5H = re.compile(
-    r"5h\s+limit:\s+\[([█░\s]+)\]\s+(\d+)%\s+left\s+\(resets\s+([^)]+)\)",
+    r"5h\s+limit:\s+\[([█░\s]+)\]\s+(\d+)%\s+left(?:\s+\(resets\s+([^)]+)\))?",
     re.IGNORECASE,
 )
 
 # Matches: "Weekly limit:  [███████░░░] 92% left (resets 11:59 on 27 May)"
 _RE_WEEKLY = re.compile(
-    r"Weekly\s+limit:\s+\[([█░\s]+)\]\s+(\d+)%\s+left\s+\(resets\s+([^)]+)\)",
+    r"Weekly\s+limit:\s+\[([█░\s]+)\]\s+(\d+)%\s+left(?:\s+\(resets\s+([^)]+)\))?",
     re.IGNORECASE,
 )
 
@@ -49,11 +54,34 @@ _RE_FIELDS = {
 }
 
 
+def clean_terminal_output(raw: str) -> str:
+    """Strip terminal control codes and box characters from Codex TUI output."""
+    text = _RE_ANSI.sub("", raw)
+    text = text.replace("\r", "\n")
+
+    lines = []
+    for line in text.splitlines():
+        line = line.translate(str.maketrans({
+            "│": " ",
+            "╭": " ",
+            "╮": " ",
+            "╰": " ",
+            "╯": " ",
+            "─": " ",
+        }))
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
 def parse_status(raw: str) -> dict | None:
     """Return a dict of parsed values from the /status box, or None."""
     if not raw:
         return None
 
+    raw = clean_terminal_output(raw)
     result: dict = {"timestamp": datetime.now().isoformat(timespec="seconds")}
 
     m = _RE_5H.search(raw)
@@ -61,7 +89,7 @@ def parse_status(raw: str) -> dict | None:
         result["limit_5h"] = {
             "bar": m.group(1).strip(),
             "percent_left": int(m.group(2)),
-            "resets": m.group(3).strip(),
+            "resets": (m.group(3) or "unknown").strip(),
         }
 
     m = _RE_WEEKLY.search(raw)
@@ -69,7 +97,7 @@ def parse_status(raw: str) -> dict | None:
         result["limit_weekly"] = {
             "bar": m.group(1).strip(),
             "percent_left": int(m.group(2)),
-            "resets": m.group(3).strip(),
+            "resets": (m.group(3) or "unknown").strip(),
         }
 
     for key, pattern in _RE_FIELDS.items():
@@ -84,38 +112,74 @@ def parse_status(raw: str) -> dict | None:
     return result
 
 
-def get_raw_status(codex_cmd: str = "codex", timeout: int = 45) -> str | None:
+def read_until_quiet(child: pexpect.spawn, timeout: int, quiet: float = 1.0, required=None) -> str:
+    """Read TUI output until it stops changing or the timeout expires."""
+    data = ""
+    deadline = time.time() + timeout
+    last_activity = time.time()
+    saw_required = required is None
+
+    while time.time() < deadline:
+        try:
+            data += child.read_nonblocking(size=4096, timeout=0.2)
+            last_activity = time.time()
+            if required is not None and required(clean_terminal_output(data)):
+                saw_required = True
+        except pexpect.TIMEOUT:
+            if data and saw_required and time.time() - last_activity >= quiet:
+                break
+        except pexpect.EOF:
+            break
+
+    return data
+
+
+def get_raw_status(codex_cmd: str = "codex --no-alt-screen", timeout: int = 45) -> str | None:
     """
     Spawn the Codex CLI, send /status, return the raw captured text.
     Returns None on failure.
     """
-    # Codex CLI typically shows a '>' prompt character
-    prompt_pattern = r"[>►❯➤]\s*$"
-
     try:
+        argv = shlex.split(codex_cmd)
         child = pexpect.spawn(
-            codex_cmd,
+            argv[0],
+            argv[1:],
             encoding="utf-8",
             timeout=timeout,
             echo=False,
         )
 
-        # Wait for the initial prompt (CLI ready)
-        idx = child.expect([prompt_pattern, pexpect.EOF, pexpect.TIMEOUT], timeout=timeout)
-        if idx != 0:
+        # Wait for the TUI to finish initial rendering/MCP startup.
+        startup = read_until_quiet(
+            child,
+            timeout=timeout,
+            required=lambda text: "OpenAI Codex" in text or "Press enter to continue" in text,
+        )
+        if "Press enter to continue" in clean_terminal_output(startup):
+            child.send("\r\n")
+            startup += read_until_quiet(
+                child,
+                timeout=timeout,
+                required=lambda text: "OpenAI Codex" in text,
+            )
+
+        # Send /status command
+        child.send("/status\r\n\r\n")
+
+        raw = startup + read_until_quiet(
+            child,
+            timeout=30,
+            required=lambda text: "5h limit:" in text or "Weekly limit:" in text,
+        )
+        cleaned = clean_terminal_output(raw)
+        if "5h limit:" not in cleaned and "Weekly limit:" not in cleaned:
             child.close(force=True)
             return None
 
-        # Send /status command
-        child.sendline("/status")
-
-        # Collect output until prompt reappears
-        idx = child.expect([prompt_pattern, pexpect.EOF, pexpect.TIMEOUT], timeout=30)
-        raw = child.before or ""
-
         # Graceful exit
         try:
-            child.sendline("/exit")
+            child.sendcontrol("c")
+            child.sendcontrol("c")
             child.expect(pexpect.EOF, timeout=5)
         except Exception:
             child.close(force=True)
@@ -154,6 +218,8 @@ def fetch_and_save(codex_cmd: str = "codex") -> dict | None:
 
 
 def main() -> None:
+    global STATUS_FILE
+
     parser = argparse.ArgumentParser(description="Fetch Codex CLI /status and save to JSON.")
     parser.add_argument("--codex", default="codex", metavar="PATH",
                         help="Path to the codex executable (default: codex)")
@@ -163,7 +229,6 @@ def main() -> None:
                         help=f"Output JSON path (default: {STATUS_FILE})")
     args = parser.parse_args()
 
-    global STATUS_FILE
     STATUS_FILE = Path(args.output)
 
     if args.loop > 0:

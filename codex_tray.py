@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 codex_tray.py — System tray widget that reads ~/.codex-usage/status.json
-and shows Codex usage bars as a live indicator.
+and ~/.claude-usage/status.json and shows Codex + Claude usage bars.
 
 Left-click  → nothing (data visible in tooltip / menu)
 Right-click → full detail menu + Refresh + Quit
@@ -23,10 +23,12 @@ except ImportError:
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-STATUS_FILE = Path.home() / ".codex-usage" / "status.json"
-MONITOR_SCRIPT = Path(__file__).parent / "codex_monitor.py"
+STATUS_FILE        = Path.home() / ".codex-usage"  / "status.json"
+CLAUDE_STATUS_FILE = Path.home() / ".claude-usage" / "status.json"
+MONITOR_SCRIPT        = Path(__file__).parent / "codex_monitor.py"
+CLAUDE_MONITOR_SCRIPT = Path(__file__).parent / "claude_monitor.py"
 ICON_SIZE = 64
-FILE_POLL_INTERVAL = 30   # seconds between re-reads of status.json
+FILE_POLL_INTERVAL = 30   # seconds between re-reads of status files
 STALE_WARN_MINUTES = 60   # warn in tooltip when data is this old
 
 # ── colour palette ────────────────────────────────────────────────────────────
@@ -50,39 +52,43 @@ def _bar_colour(pct: int | None) -> tuple:
     return COLOUR_RED
 
 
-def make_icon(pct_5h: int | None, pct_wk: int | None) -> Image.Image:
-    """Draw a 64×64 RGBA icon with two usage bars."""
+def make_icon(
+    cdx_5h: int | None, cdx_wk: int | None,
+    cla_5h: int | None, cla_7d: int | None,
+) -> Image.Image:
+    """Draw a 64×64 RGBA icon with four usage bars (Codex + Claude)."""
     img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Rounded background
     draw.rounded_rectangle([0, 0, ICON_SIZE - 1, ICON_SIZE - 1],
                            radius=10, fill=COLOUR_BG)
 
     bar_x = 5
     bar_w = ICON_SIZE - 10
-    bar_h = 12
+    bar_h = 8   # smaller bars to fit four rows
 
     def draw_bar(top: int, pct: int | None, label: str) -> None:
-        # Label
-        draw.text((bar_x, top - 11), label, fill=COLOUR_LABEL)
-        # Background track
+        draw.text((bar_x, top - 9), label, fill=COLOUR_LABEL)
         draw.rounded_rectangle([bar_x, top, bar_x + bar_w, top + bar_h],
-                               radius=3, fill=COLOUR_BAR_BG)
-        # Fill
+                               radius=2, fill=COLOUR_BAR_BG)
         if pct is not None and pct > 0:
-            fill_w = max(3, int(bar_w * pct / 100))
+            fill_w = max(2, int(bar_w * pct / 100))
             draw.rounded_rectangle([bar_x, top, bar_x + fill_w, top + bar_h],
-                                   radius=3, fill=_bar_colour(pct))
-        # Percentage text centred on bar
+                                   radius=2, fill=_bar_colour(pct))
         if pct is not None:
             txt = f"{pct}%"
-            # Estimate text width: ~5px per char at default font
             tx = bar_x + (bar_w - len(txt) * 5) // 2
-            draw.text((tx, top + 1), txt, fill=COLOUR_TEXT)
+            draw.text((tx, top), txt, fill=COLOUR_TEXT)
 
-    draw_bar(22, pct_5h, "5h")
-    draw_bar(47, pct_wk, "wk")
+    # Codex rows
+    draw_bar(12, cdx_5h, "C5h")
+    draw_bar(27, cdx_wk, "Cwk")
+    # Separator dot
+    draw.ellipse([bar_x + bar_w // 2 - 1, 36, bar_x + bar_w // 2 + 1, 38],
+                 fill=COLOUR_LABEL)
+    # Claude rows
+    draw_bar(42, cla_5h, "L5h")
+    draw_bar(57, cla_7d, "L7d")
 
     return img
 
@@ -99,12 +105,19 @@ def make_icon_unknown() -> Image.Image:
 
 # ── status file helpers ───────────────────────────────────────────────────────
 
-def read_status() -> dict | None:
+def _read_json(path: Path) -> dict | None:
     try:
-        with open(STATUS_FILE) as fh:
-            return json.load(fh)
+        return json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def read_status() -> dict | None:
+    return _read_json(STATUS_FILE)
+
+
+def read_claude_status() -> dict | None:
+    return _read_json(CLAUDE_STATUS_FILE)
 
 
 def data_age_minutes(data: dict) -> float | None:
@@ -120,27 +133,41 @@ def data_age_minutes(data: dict) -> float | None:
         return None
 
 
-def fmt_tooltip(data: dict | None) -> str:
-    if not data:
-        return "Codex Usage\nNo data — run codex_monitor.py first"
+def fmt_tooltip(codex: dict | None, claude: dict | None) -> str:
+    lines = ["Codex + Claude Usage"]
 
-    lines = ["Codex Usage Monitor"]
-    l5 = data.get("limit_5h")
-    lw = data.get("limit_weekly")
-    if l5:
-        lines.append(f"5h:     {l5['percent_left']}% left  (resets {l5['resets']})")
-    if lw:
-        lines.append(f"Weekly: {lw['percent_left']}% left  (resets {lw['resets']})")
-    if data.get("model"):
-        lines.append(f"Model:  {data['model']}")
-    if data.get("account"):
-        lines.append(f"Account: {data['account']}")
-    age = data_age_minutes(data)
-    if age is not None:
-        age_str = f"{int(age)}m ago"
-        if age >= STALE_WARN_MINUTES:
-            age_str += " ⚠ stale"
-        lines.append(f"Updated: {age_str}")
+    if codex:
+        l5 = codex.get("limit_5h")
+        lw = codex.get("limit_weekly")
+        lines.append("── Codex ──")
+        if l5:
+            lines.append(f"  5h:     {l5['percent_left']}% left  (resets {l5['resets']})")
+        if lw:
+            lines.append(f"  Weekly: {lw['percent_left']}% left  (resets {lw['resets']})")
+        age = data_age_minutes(codex)
+        if age is not None:
+            age_str = f"{int(age)}m ago" + (" ⚠ stale" if age >= STALE_WARN_MINUTES else "")
+            lines.append(f"  Updated: {age_str}")
+    else:
+        lines.append("── Codex ──")
+        lines.append("  No data — run codex_monitor.py first")
+
+    if claude:
+        l5 = claude.get("limit_5h")
+        lw = claude.get("limit_weekly")
+        lines.append("── Claude ──")
+        if l5:
+            lines.append(f"  5h:  {l5['percent_left']}% left  (resets {l5['resets']})")
+        if lw:
+            lines.append(f"  7d:  {lw['percent_left']}% left  (resets {lw['resets']})")
+        age = data_age_minutes(claude)
+        if age is not None:
+            age_str = f"{int(age)}m ago" + (" ⚠ stale" if age >= STALE_WARN_MINUTES else "")
+            lines.append(f"  Updated: {age_str}")
+    else:
+        lines.append("── Claude ──")
+        lines.append("  No data — run claude_monitor.py first")
+
     return "\n".join(lines)
 
 
@@ -149,69 +176,84 @@ def fmt_tooltip(data: dict | None) -> str:
 class CodexTray:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._data: dict | None = read_status()
+        self._codex: dict | None = read_status()
+        self._claude: dict | None = read_claude_status()
         self._refreshing = False
 
-        icon_img = self._render_icon()
         self._icon = pystray.Icon(
             "codex-usage",
-            icon_img,
-            title=fmt_tooltip(self._data),
+            self._render_icon(),
+            title=fmt_tooltip(self._codex, self._claude),
             menu=self._build_menu(),
         )
 
     # ── icon rendering ────────────────────────────────────────────────────────
 
     def _render_icon(self) -> Image.Image:
-        if not self._data:
+        if not self._codex and not self._claude:
             return make_icon_unknown()
-        pct_5h = (self._data.get("limit_5h") or {}).get("percent_left")
-        pct_wk = (self._data.get("limit_weekly") or {}).get("percent_left")
-        return make_icon(pct_5h, pct_wk)
+        cdx_5h = (self._codex  or {}).get("limit_5h", {}).get("percent_left")
+        cdx_wk = (self._codex  or {}).get("limit_weekly", {}).get("percent_left")
+        cla_5h = (self._claude or {}).get("limit_5h", {}).get("percent_left")
+        cla_7d = (self._claude or {}).get("limit_weekly", {}).get("percent_left")
+        return make_icon(cdx_5h, cdx_wk, cla_5h, cla_7d)
 
     # ── menu ──────────────────────────────────────────────────────────────────
 
     def _build_menu(self) -> pystray.Menu:
         items: list = []
-        data = self._data
 
-        if not data:
-            items.append(Item("No data yet", None, enabled=False))
-            items.append(Item("Run: python3 codex_monitor.py", None, enabled=False))
+        # ── Codex section ──
+        items.append(Item("── Codex ──", None, enabled=False))
+        if not self._codex:
+            items.append(Item("  No data — run codex_monitor.py", None, enabled=False))
         else:
-            l5 = data.get("limit_5h")
-            lw = data.get("limit_weekly")
-
+            l5 = self._codex.get("limit_5h")
+            lw = self._codex.get("limit_weekly")
             if l5:
                 bar = self._ascii_bar(l5["percent_left"])
                 items.append(Item(
-                    f"5h:     {bar}  {l5['percent_left']}% left  (resets {l5['resets']})",
+                    f"  5h:     {bar}  {l5['percent_left']}% left  (resets {l5['resets']})",
                     None, enabled=False,
                 ))
             if lw:
                 bar = self._ascii_bar(lw["percent_left"])
                 items.append(Item(
-                    f"Weekly: {bar}  {lw['percent_left']}% left  (resets {lw['resets']})",
+                    f"  Weekly: {bar}  {lw['percent_left']}% left  (resets {lw['resets']})",
                     None, enabled=False,
                 ))
-            if l5 or lw:
-                items.append(pystray.Menu.SEPARATOR)
-
-            if data.get("model"):
-                items.append(Item(f"Model:   {data['model']}", None, enabled=False))
-            if data.get("account"):
-                items.append(Item(f"Account: {data['account']}", None, enabled=False))
-            if data.get("session"):
-                short_sess = data["session"][:18] + "…"
-                items.append(Item(f"Session: {short_sess}", None, enabled=False))
-
-            age = data_age_minutes(data)
+            if self._codex.get("model"):
+                items.append(Item(f"  Model:  {self._codex['model']}", None, enabled=False))
+            age = data_age_minutes(self._codex)
             if age is not None:
-                age_str = f"{int(age)}m ago"
-                if age >= STALE_WARN_MINUTES:
-                    age_str += " ⚠ data may be stale"
-                items.append(pystray.Menu.SEPARATOR)
-                items.append(Item(f"Updated: {age_str}", None, enabled=False))
+                age_str = f"{int(age)}m ago" + (" ⚠ stale" if age >= STALE_WARN_MINUTES else "")
+                items.append(Item(f"  Updated: {age_str}", None, enabled=False))
+
+        items.append(pystray.Menu.SEPARATOR)
+
+        # ── Claude section ──
+        items.append(Item("── Claude Code ──", None, enabled=False))
+        if not self._claude:
+            items.append(Item("  No data — run claude_monitor.py", None, enabled=False))
+        else:
+            l5 = self._claude.get("limit_5h")
+            lw = self._claude.get("limit_weekly")
+            if l5:
+                bar = self._ascii_bar(l5["percent_left"])
+                items.append(Item(
+                    f"  5h: {bar}  {l5['percent_left']}% left  (resets {l5['resets']})",
+                    None, enabled=False,
+                ))
+            if lw:
+                bar = self._ascii_bar(lw["percent_left"])
+                items.append(Item(
+                    f"  7d: {bar}  {lw['percent_left']}% left  (resets {lw['resets']})",
+                    None, enabled=False,
+                ))
+            age = data_age_minutes(self._claude)
+            if age is not None:
+                age_str = f"{int(age)}m ago" + (" ⚠ stale" if age >= STALE_WARN_MINUTES else "")
+                items.append(Item(f"  Updated: {age_str}", None, enabled=False))
 
         items.append(pystray.Menu.SEPARATOR)
         items.append(Item("Refresh now", self._on_refresh))
@@ -234,16 +276,22 @@ class CodexTray:
     def _do_refresh(self) -> None:
         self._refreshing = True
         try:
-            result = subprocess.run(
-                [sys.executable, str(MONITOR_SCRIPT)],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode == 0:
-                self._reload()
-            else:
-                print("[codex_tray] Monitor script failed:\n", result.stderr, file=sys.stderr)
-        except subprocess.TimeoutExpired:
-            print("[codex_tray] Monitor timed out.", file=sys.stderr)
+            # Run both monitors in parallel
+            procs = [
+                subprocess.Popen([sys.executable, str(MONITOR_SCRIPT)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
+                subprocess.Popen([sys.executable, str(CLAUDE_MONITOR_SCRIPT)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
+            ]
+            for p in procs:
+                try:
+                    _, err = p.communicate(timeout=60)
+                    if p.returncode != 0 and err:
+                        print(f"[codex_tray] Monitor error: {err.decode()[:200]}", file=sys.stderr)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    print("[codex_tray] Monitor timed out.", file=sys.stderr)
+            self._reload()
         except Exception as exc:
             print(f"[codex_tray] Refresh error: {exc}", file=sys.stderr)
         finally:
@@ -261,9 +309,10 @@ class CodexTray:
 
     def _reload(self) -> None:
         with self._lock:
-            self._data = read_status()
+            self._codex = read_status()
+            self._claude = read_claude_status()
         self._icon.icon = self._render_icon()
-        self._icon.title = fmt_tooltip(self._data)
+        self._icon.title = fmt_tooltip(self._codex, self._claude)
         self._icon.menu = self._build_menu()
 
     # ── entry point ───────────────────────────────────────────────────────────
